@@ -25,4 +25,5 @@ type PreimageOracleContract interface {
 	InitLargePreimage(uuid *big.Int, partOffset uint32, claimedSize uint32) (txmgr.TxCandidate, error)
 	AddLeaves(uuid *big.Int, input []byte, commitments [][32]byte, finalize bool) (txmgr.TxCandidate, error)
 	Squeeze(claimant common.Address, uuid *big.Int, stateMatrix *matrix.StateMatrix, preState contracts.Leaf, preStateProof contracts.MerkleProof, postState contracts.Leaf, postStateProof contracts.MerkleProof) (txmgr.TxCandidate, error)
+	CallSqueeze(ctx context.Context, claimant common.Address, uuid *big.Int, stateMatrix *matrix.StateMatrix, preState contracts.Leaf, preStateProof contracts.MerkleProof, postState contracts.Leaf, postStateProof contracts.MerkleProof) error
 }

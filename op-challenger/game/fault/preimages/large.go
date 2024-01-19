@@ -9,14 +9,14 @@ import (
 	"io"
 	"math/big"
 
+	"github.com/ethereum-optimism/optimism/op-challenger/game/fault/contracts"
 	"github.com/ethereum-optimism/optimism/op-challenger/game/fault/types"
 	"github.com/ethereum-optimism/optimism/op-challenger/game/keccak/matrix"
 	"github.com/ethereum-optimism/optimism/op-service/txmgr"
+	"github.com/ethereum/go-ethereum/common"
 	ethtypes "github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/log"
 )
-
-var errNotSupported = errors.New("not supported")
 
 var _ PreimageUploader = (*LargePreimageUploader)(nil)
 
@@ -52,21 +52,37 @@ func NewLargePreimageUploader(logger log.Logger, txMgr txmgr.TxManager, contract
 	return &LargePreimageUploader{logger, txMgr, contract}
 }
 
+func NewContractLeaf(input []byte, index *big.Int, commitment common.Hash) contracts.Leaf {
+	// Pad the input to the 136 byte leaf size.
+	input = append(input, make([]byte, matrix.LeafSize-len(input))...)
+	return contracts.Leaf{
+		Input:           ([136]byte)(input),
+		Index:           index,
+		StateCommitment: commitment,
+	}
+}
+
 func (p *LargePreimageUploader) UploadPreimage(ctx context.Context, parent uint64, data *types.PreimageOracleData) error {
-	// Split the preimage data into chunks of size [MaxChunkSize] (except the last chunk).
 	stateMatrix := matrix.NewStateMatrix()
+	// SAFETY: The chunk size is a multiple of the leaf size (except for the last chunk/leaf).
 	chunk := make([]byte, 0, MaxChunkSize)
 	calls := []Chunk{}
+	// SAFETY: The prestate and postate leaf are always set since the preimage data must be sufficiently large.
+	var prestateLeaf contracts.Leaf
+	var poststateLeaf contracts.Leaf
 	commitments := make([][32]byte, 0, MaxLeafsPerChunk)
 	in := bytes.NewReader(data.OracleData)
 	for i := 0; ; i++ {
-		// Absorb the next preimage chunk leaf and run the keccak permutation.
+		// SAFETY: The preimage input is never mutated and the keccak state matrix handles the keccak padding rules.
 		leaf, err := stateMatrix.AbsorbNextLeaf(in)
+		stateCommitment := stateMatrix.StateCommitment()
 		chunk = append(chunk, leaf...)
-		commitments = append(commitments, stateMatrix.StateCommitment())
-		// SAFETY: the last leaf will always return an [io.EOF] error from [AbsorbNextLeaf].
+		commitments = append(commitments, stateCommitment)
+		// SAFETY: The last leaf will always return an [io.EOF] error from [AbsorbNextLeaf].
+		// SAFETY: Since the last leaf will always hit this branch, we can safely update the poststate leaf.
 		if errors.Is(err, io.EOF) {
 			calls = append(calls, Chunk{chunk, commitments[:], true})
+			poststateLeaf = NewContractLeaf(leaf, big.NewInt(int64(i)), stateCommitment)
 			break
 		}
 		if err != nil {
@@ -79,6 +95,9 @@ func (p *LargePreimageUploader) UploadPreimage(ctx context.Context, parent uint6
 			chunk = make([]byte, 0, MaxChunkSize)
 			commitments = make([][32]byte, 0, MaxLeafsPerChunk)
 		}
+
+		// SAFETY: This is never the last leaf since the loop will break before this assignment.
+		prestateLeaf = NewContractLeaf(leaf, big.NewInt(int64(i)), stateCommitment)
 	}
 
 	// TODO(client-pod#473): The UUID must be deterministic so the challenger can resume uploads.
@@ -97,16 +116,56 @@ func (p *LargePreimageUploader) UploadPreimage(ctx context.Context, parent uint6
 		return fmt.Errorf("failed to add leaves to large preimage with uuid: %s: %w", uuid, err)
 	}
 
-	// todo(proofs#467): track the challenge period starting once the full preimage is posted.
-	// todo(proofs#467): once the challenge period is over, call `squeezeLPP` on the preimage oracle contract.
+	// TODO(client-pod#474): To generate the inclusion proofs, we need to construct the merkle tree for the preimage data.
+	// TODO(client-pod#474): 1. Create the fully zeroed out merkle tree.
+	// TODO(client-pod#474): 2. Take all of the input and state commitments and reconstruct the merkle tree.
+	// TODO(client-pod#474): 3. Generate proofs of inclusion.
+	prestateProof := contracts.MerkleProof{}
+	poststateProof := contracts.MerkleProof{}
 
-	return errNotSupported
+	return p.Squeeze(
+		ctx,
+		p.txMgr.From(),
+		uuid,
+		stateMatrix,
+		prestateLeaf,
+		prestateProof,
+		poststateLeaf,
+		poststateProof,
+	)
 }
 
 func (p *LargePreimageUploader) newUUID() (*big.Int, error) {
 	max := new(big.Int)
 	max.Exp(big.NewInt(2), big.NewInt(130), nil).Sub(max, big.NewInt(1))
 	return rand.Int(rand.Reader, max)
+}
+
+func (p *LargePreimageUploader) Squeeze(
+	ctx context.Context,
+	claimant common.Address,
+	uuid *big.Int,
+	stateMatrix *matrix.StateMatrix,
+	preState contracts.Leaf,
+	preStateProof contracts.MerkleProof,
+	postState contracts.Leaf,
+	postStateProof contracts.MerkleProof,
+) error {
+	// TODO(client-pod#474): Return the ErrChallengePeriodNotOver error if the challenge period is not over.
+	//                       This allows the responder to retry the squeeze later.
+	//                       Other errors should force the responder to stop retrying.
+	//                       Nil errors should indicate the squeeze was successful.
+	if err := p.contract.CallSqueeze(ctx, claimant, uuid, stateMatrix, preState, preStateProof, postState, postStateProof); err != nil {
+		return fmt.Errorf("failed to call squeeze: %w", err)
+	}
+	tx, err := p.contract.Squeeze(claimant, uuid, stateMatrix, preState, preStateProof, postState, postStateProof)
+	if err != nil {
+		return fmt.Errorf("failed to create pre-image oracle tx: %w", err)
+	}
+	if err := p.sendTxAndWait(ctx, tx); err != nil {
+		return fmt.Errorf("failed to populate pre-image oracle: %w", err)
+	}
+	return nil
 }
 
 // initLargePreimage initializes the large preimage proposal.
