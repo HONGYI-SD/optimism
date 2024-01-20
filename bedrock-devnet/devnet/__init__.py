@@ -58,6 +58,7 @@ def main():
     devnet_dir = pjoin(monorepo_dir, '.devnet')
     contracts_bedrock_dir = pjoin(monorepo_dir, 'packages', 'contracts-bedrock')
     deployment_dir = pjoin(contracts_bedrock_dir, 'deployments', 'devnetL1')
+    forge_dump_path = pjoin(contracts_bedrock_dir, 'Deploy-1337.json')
     op_node_dir = pjoin(args.monorepo_dir, 'op-node')
     ops_bedrock_dir = pjoin(monorepo_dir, 'ops-bedrock')
     deploy_config_dir = pjoin(contracts_bedrock_dir, 'deploy-config')
@@ -71,6 +72,7 @@ def main():
       devnet_dir=devnet_dir,
       contracts_bedrock_dir=contracts_bedrock_dir,
       deployment_dir=deployment_dir,
+      forge_dump_path=forge_dump_path,
       l1_deployments_path=pjoin(deployment_dir, '.deploy'),
       deploy_config_dir=deploy_config_dir,
       devnet_config_path=devnet_config_path,
@@ -159,24 +161,17 @@ def devnet_l1_genesis(paths):
     log.info('Generating L1 genesis state')
     init_devnet_l1_deploy_config(paths)
 
-    geth = subprocess.Popen([
-        'anvil', '-a', '10', '--port', '8545', '--chain-id', '1337', '--disable-block-gas-limit',
-        '--gas-price', '0', '--base-fee', '1', '--block-time', '1'
-    ])
+    fqn = 'scripts/Deploy.s.sol:Deploy'
+    run_command([
+        'forge', 'script', '--chain-id', '1337', fqn, "--sig", "runWithStateDump()"
+    ], env={ 'WITH_STATE_DUMP': 'true' }, cwd=paths.contracts_bedrock_dir)
 
-    try:
-        forge = ChildProcess(deploy_contracts, paths)
-        forge.start()
-        forge.join()
-        err = forge.get_error()
-        if err:
-            raise Exception(f"Exception occurred in child process: {err}")
+    forge_dump = read_json(paths.forge_dump_path)
+    allocs = convert_forge_dump(forge_dump)
+    write_json(paths.allocs_path, allocs)
+    os.remove(paths.forge_dump_path)
 
-        res = anvil_dumpState('127.0.0.1:8545')
-        allocs = convert_anvil_dump(res)
-        write_json(paths.allocs_path, allocs)
-    finally:
-        geth.terminate()
+    shutil.copy(paths.l1_deployments_path, paths.addresses_json_path)
 
 
 # Bring up the devnet where the contracts are deployed to L1
@@ -293,6 +288,20 @@ def convert_anvil_dump(dump):
                 storage[pad_hex(key)] = pad_hex(value)
 
     return dump
+
+def convert_forge_dump(dump):
+    for _, data in dump.items():
+        bal = data['balance']
+        data['balance'] = str(int(bal, 16))
+
+        if 'storage' in data:
+            storage = data['storage']
+            converted_storage = {}
+            for key, value in storage.items():
+                converted_storage[pad_hex(key)] = pad_hex(value)
+            data['storage'] = converted_storage
+
+    return { 'accounts': dump }
 
 def pad_hex(input):
     return '0x' + input.replace('0x', '').zfill(64)
